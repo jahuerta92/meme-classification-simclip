@@ -1,0 +1,41 @@
+version: '3'
+
+networks:
+    docker_net0:
+        driver: bridge
+    ipam:
+        driver: default
+        
+services:
+  torch_jupyter:
+    shm_size: '16gb'
+    build: 
+        context: ./torch_jupyter
+        args:
+          - UID=${UID}
+          - GID=${GID}
+          - USER=${USER}
+    deploy:
+        resources:
+          reservations:
+            devices:
+              - capabilities: 
+                  - gpu
+    container_name: ${CONTAINER_NAME}
+    networks:
+        - docker_net0
+    environment: 
+        - JUPYTER_ENABLE_LAB=yes
+        - GRANT_SUDO=yes
+        - NB_UID=${UID}
+        - NB_GID=${GID}
+        - JUPYTER_TOKEN=${JUPYTER_PASSWORD}
+    user: ${UID}:${GID}
+    volumes:
+        - "${PWD}:/home/${USER}/work"
+        - "${PWD}/../shared_nas_data:/home/${USER}/work/data" 
+    env_file:
+        - .env
+    ports:
+        - "${PORT}:8888"
+    restart: always
