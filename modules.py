@@ -24,7 +24,9 @@ class TransformerFuser(nn.Module):
         x = self.transformer(x,src_key_padding_mask=mask)
         txt_token_idx = img.shape[0]
         img_token, txt_token = x[:, 0], x[:, txt_token_idx]
-        return torch.cat([img_token, txt_token, img_token*txt_token, torch.abs(img_token-txt_token)], dim=-1)
+        return torch.cat([img_token, txt_token, 
+                          #img_token*txt_token, torch.abs(img_token-txt_token),
+                          ], dim=-1)
 
 class SimilarityFuser(nn.Module):
     def __init__(self, input_dim):
