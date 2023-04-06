@@ -49,7 +49,7 @@ RUN pip3 install --upgrade jupyterlab-git nbdime aquirdturtle_collapsible_headin
 RUN pip3 install --upgrade scikit-learn fastgpu pandas transformers tokenizers datasets \
                            pymongo emoji python-dotenv colored pytesseract \
                            wandb spacy sentencepiece einops pytorch-lightning sentencepiece\
-                           nltk seaborn torch torchvision torchaudio \
+                           nltk seaborn torch torchvision torchaudio niacin scipy \
                            --extra-index-url https://download.pytorch.org/whl/cu116
 
 # Jupyterlab lsp

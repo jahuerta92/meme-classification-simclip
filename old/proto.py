@@ -2,7 +2,7 @@ from data_utils import data_loader, class_weights
 
 from argparse import ArgumentParser
 
-from model import Layoutlmv3Model, ViltModel
+from model import ViltModel
 
 import pytorch_lightning as L
 
@@ -31,10 +31,10 @@ DATA_CODE = args.dataset
 MODEL_CODE = 'dandelin/vilt-b32-finetuned-nlvr2'
 BATCH_SIZE = 64 if args.batch > 64 else args.batch
 ACCUM_STEPS = 1 if args.batch <= 64 else args.batch//64
-TRAIN_EPOCHS = 20 * (128//BATCH_SIZE*ACCUM_STEPS) #1000 * (512/BATCH_SIZE*ACCUM_STEPS)  #1000 # 1000 for Memotion7k 500 for multioff
+TRAIN_EPOCHS = 25 #* (128//BATCH_SIZE*ACCUM_STEPS) #1000 * (512/BATCH_SIZE*ACCUM_STEPS)  #1000 # 1000 for Memotion7k 500 for multioff
 FROZEN = args.freeze 
-LR = (BATCH_SIZE*ACCUM_STEPS/64)* 1e-5 # Learning rate proportional to batch size (64 == 3e-5)
-
+LR = (BATCH_SIZE*ACCUM_STEPS/256) * 1e-4 # Learning rate proportional to batch size (64 == 2e-5)
+DROPOUT = .25 
 ###############################################################################
 # MAIN ########################################################################
 ###############################################################################
@@ -48,7 +48,8 @@ def main():
                         class_weights(DATA_CODE),
                         training_steps=TRAIN_EPOCHS*len(train)//ACCUM_STEPS,
                         lr=LR,
-                        frozen=FROZEN)
+                        frozen=FROZEN,
+                        dropout=DROPOUT)
     
     # Callbacks
     wandb.login()
@@ -60,13 +61,16 @@ def main():
                                            'Scheduling': f'Linear decay',
                                            'Train epochs': TRAIN_EPOCHS,
                                            'Backend model': MODEL_CODE,
-                                           })
+                                           'Dropout': DROPOUT,
+                                           })    
     callbacks = [
           ModelCheckpoint(
             verbose=True,
             dirpath = f"checkpoints/{DATA_CODE}",
+            filename = wandb_logger.experiment.name,
             every_n_epochs= 5 if DATA_CODE == 'multioff' else 1,
             save_top_k=1,
+            mode='max',
             monitor='valid_mean_f1'
         ), 
     ]
@@ -75,7 +79,7 @@ def main():
                         devices=[0], 
                         precision=16, 
                         callbacks=callbacks,
-                        check_val_every_n_epoch= 5 if DATA_CODE == 'multioff' else 1,
+                        check_val_every_n_epoch= 1,
                         logger=wandb_logger,
                         accelerator='gpu',
                         log_every_n_steps=10,
@@ -83,6 +87,7 @@ def main():
                         )
     
     trainer.fit(model, train, dev)
+
     results = trainer.test(model, dev, ckpt_path=callbacks[0].best_model_path)
     with open(f"results/{wandb_logger.experiment.name}.json", 'w') as f:
         json.dump(results, f)
