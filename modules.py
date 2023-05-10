@@ -1,32 +1,285 @@
 from torch import nn
 import torch
 import torch.nn.functional as F
+import pytorch_lightning as L
 
-
-
-class TransformerFuser(nn.Module):
-    def __init__(self, input_dim, layers=1, heads=12, dropout=.1):
+class FFLayer(nn.Module):
+    def __init__(self, in_dim, out_dim=None, dropout=.1, norm=True):
         super().__init__()
-        module = nn.TransformerEncoderLayer(input_dim, heads, input_dim*4, 
+        layers = []
+        if out_dim is None:
+            out_dim = in_dim
+        if norm:
+            layers.append(nn.LayerNorm(in_dim))
+        layers.append(nn.Linear(in_dim, out_dim)),           
+        layers.append(nn.GELU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.layer = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layer(x)
+    
+class FFResLayer(nn.Module):
+    def __init__(self, in_dim, dropout=.1, norm=True):
+        super().__init__()
+        layers = []
+        if norm:
+            layers.append(nn.LayerNorm(in_dim))
+        layers.append(nn.Linear(in_dim, in_dim)),           
+        layers.append(nn.GELU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        self.layer = nn.Sequential(*layers)
+    def forward(self, x):
+        return self.layer(x) + x
+
+class OutLayer(nn.Module):
+    def __init__(self, in_dim, outputs, norm=True):
+        super().__init__()
+        layers = []
+        if norm:
+            layers.append(nn.LayerNorm(in_dim))
+        layers.append(nn.Linear(in_dim, in_dim)),           
+        layers.append(nn.GELU())
+        layers.append(nn.Linear(in_dim, outputs)),           
+        self.layer = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layer(x)
+
+class FFHead(nn.Module):
+    def __init__(self, hidden_dim, n_outputs, n_layers=1, dropout=.1, norm=True, residual=True):
+        super().__init__()
+        layertype = FFResLayer if residual else FFLayer 
+        fflayers = [nn.Dropout(dropout)] + \
+                   [layertype(hidden_dim, dropout=dropout, norm=norm) for _ in range(n_layers)] + \
+                   [OutLayer(hidden_dim, n_outputs)]
+        self.classifier = nn.Sequential(*fflayers)
+
+    def forward(self, x):
+        return self.classifier(x)
+
+class NormalizeProject(nn.Module):
+    def __init__(self, hidden_dim, output_dim):
+        super().__init__()
+        self.projection_img = nn.Linear(hidden_dim, output_dim)
+        self.projection_txt = nn.Linear(hidden_dim, output_dim)
+        self.projection_prod = nn.Linear(hidden_dim, output_dim)
+        self.projection_diff = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, img, txt, prod=None, diff=None):
+        if prod is None:
+            prod = txt*img
+        if diff is None:
+            diff = torch.abs(txt-img)
+
+        img_p = self.projection_img(F.normalize(img, dim=-1))
+        txt_p = self.projection_txt(F.normalize(txt, dim=-1))
+        prod_p = self.projection_prod(F.normalize(prod, dim=-1))
+        diff_p = self.projection_diff(F.normalize(diff, dim=-1))
+
+        return img_p, txt_p, prod_p, diff_p
+
+class BatchnNormProject(nn.Module):
+    def __init__(self, hidden_dim, output_dim):
+        super().__init__()
+        self.projection = nn.Linear(hidden_dim, output_dim)
+        self.batchnorm = nn.BatchNorm1d(hidden_dim)
+
+    def forward(self, x):
+        return self.projection(F.normalize(self.batchnorm(x), dim=-1))
+
+
+class WeightedHead(nn.Module):
+    def __init__(self, hidden_dim, middle_dim, n_outputs, dropout=.1):
+        super().__init__()
+        self.preprocess = FFLayer(hidden_dim, middle_dim, dropout=dropout)
+        self.attention = nn.Linear(hidden_dim, middle_dim)
+        self.classifier = OutLayer(middle_dim, n_outputs)
+    
+    def forward(self, img, txt):
+        representation = self.preprocess(torch.cat([img, txt, torch.abs(txt-img), txt*img], axis=-1))
+        #x = self.preprocess(stacked)
+        #att = torch.softmax(self.attention(stacked), dim=0)
+        return self.classifier(representation)
+
+class FullHead(nn.Module):
+    def __init__(self, hidden_dim, n_outputs, n_layers=1, dropout=.1):
+        super().__init__()
+        self.d_att = nn.Linear(hidden_dim, hidden_dim)
+        self.p_att = nn.Linear(hidden_dim, hidden_dim)
+        fflayers = [FFResLayer(hidden_dim*4, dropout=dropout)] + \
+                   [FFResLayer(hidden_dim*4, dropout=dropout) for _ in range(n_layers-1)]
+        self.processor = nn.Sequential(*fflayers)
+        self.classifier = OutLayer(hidden_dim*4, n_outputs)
+    
+    def _reduce_matrix(self, matrix, att_layer):
+        matrix_t = torch.transpose(matrix, 1, 2)
+        att_a = torch.softmax(att_layer(matrix.sum(-1)), -1)
+        att_b = torch.softmax(att_layer(matrix_t.sum(-1)), -1)
+
+        return torch.sum(matrix * att_b.unsqueeze(-1), 1) + torch.sum(matrix_t * att_a.unsqueeze(-1), 1)
+
+    def forward(self, img, txt, diff_m, prod_m):
+        diff = self._reduce_matrix(diff_m, self.d_att)
+        prod = self._reduce_matrix(prod_m, self.p_att)
+        all_features = torch.cat([img, txt, diff, prod], -1)
+        
+        return self.classifier(self.processor(all_features))
+
+class FuseHead(nn.Module):
+    def __init__(self, hidden_dim, n_outputs, n_layers=1, dropout=.1):
+        super().__init__()
+        concat_dim = hidden_dim*4
+        fflayers = [FFResLayer(concat_dim, dropout=dropout)] + \
+                   [FFResLayer(concat_dim, dropout=dropout) for _ in range(n_layers-1)]
+        self.processor = nn.Sequential(*fflayers)
+        self.classifier = OutLayer(concat_dim, n_outputs)
+    
+    def forward(self, img, txt):
+        diff = torch.abs(img-txt)
+        prod = img*txt
+        all_features = torch.cat([img, txt, diff, prod], -1)
+        return self.classifier(self.processor(all_features))
+
+class ReductionHead(nn.Module):
+    def __init__(self, hidden_dim, reduce_dim, n_outputs, n_layers=1, dropout=.1):
+        super().__init__()
+        
+        self.reducer = nn.Linear(hidden_dim, reduce_dim)
+
+        reduced_flat_dim = reduce_dim*reduce_dim
+        fflayers = [FFResLayer(reduced_flat_dim, dropout=dropout)] + \
+                   [FFResLayer(reduced_flat_dim, dropout=dropout) for _ in range(n_layers-1)]
+        self.processor = nn.Sequential(*fflayers)
+        self.classifier = OutLayer(reduced_flat_dim, n_outputs)
+    
+    def forward(self, img, txt):
+        prod = self.reducer(img).unsqueeze(-1) @ self.reducer(txt).unsqueeze(1)
+        bs = img.shape[0]
+        prod = prod.view(bs, -1)
+        return self.classifier(self.processor(prod))
+
+class ReduceFuseHead(nn.Module):
+    def __init__(self, hidden_dim, reduce_dim, n_outputs, n_layers=1, dropout=.1):
+        super().__init__()
+        
+        self.reducer = nn.Linear(hidden_dim, reduce_dim)
+        reduced_flat_dim = 2*reduce_dim*reduce_dim + hidden_dim*2
+        fflayers = [FFResLayer(reduced_flat_dim, dropout=dropout)] + \
+                   [FFResLayer(reduced_flat_dim, dropout=dropout) for _ in range(n_layers-1)]
+        self.processor = nn.Sequential(*fflayers)
+        self.classifier = OutLayer(reduced_flat_dim, n_outputs)
+    
+    def forward(self, img, txt):
+        bs = img.shape[0]
+        prod = (self.reducer(img).unsqueeze(-1) @ self.reducer(txt).unsqueeze(1)).view(bs, -1)
+        diff = torch.abs(self.reducer(img).unsqueeze(-1) - self.reducer(txt).unsqueeze(1)).view(bs, -1)
+        all_features = torch.cat([prod, diff, img, txt], dim=-1)
+        return self.classifier(self.processor(all_features))
+
+class FuseExtraHead(FuseHead):    
+    def forward(self, img, txt, diff, prod):
+        all_features = torch.cat([img, txt, diff, prod], -1)
+        return self.classifier(self.processor(all_features))
+
+
+class TransformerCMAFuser(nn.Module):
+    def __init__(self, hidden_dim, layers=1, dropout=.1, epsilon=1e-8):
+        super().__init__()
+
+        module = nn.TransformerEncoderLayer(hidden_dim, 12, hidden_dim*4, 
                                             dropout=dropout, 
                                             activation=F.gelu, 
                                             batch_first=True, 
                                             norm_first=True,)
+        self.siamese_attention = nn.Linear(hidden_dim, hidden_dim)
         self.transformer = nn.TransformerEncoder(module, layers)
-    
+        self.epsilon = epsilon
+
     def forward(self, img, txt, mask=None):
         if mask is not None:
             img_msk = torch.zeros_like(img[:, :, 0], device=self.device)
             txt_msk = (1-mask)
             mask = torch.cat([img_msk, txt_msk], -1).bool()
 
-        x = torch.cat([img, txt], dim=1)
-        x = self.transformer(x,src_key_padding_mask=mask)
+        x = torch.cat([img, 
+                       txt], dim=1)
+        x = self.transformer(x, src_key_padding_mask=mask)
         txt_token_idx = img.shape[0]
         img_token, txt_token = x[:, 0], x[:, txt_token_idx]
-        return torch.cat([img_token, txt_token, 
-                          #img_token*txt_token, torch.abs(img_token-txt_token),
-                          ], dim=-1)
+        
+        e_i = torch.exp(self.siamese_attention(img_token)) 
+        e_t = torch.exp(self.siamese_attention(txt_token)) 
+        lmd = e_i / (e_i + e_t)
+        return lmd * img_token + (1-lmd) * txt_token
+
+
+class CMAFuser(nn.Module):
+    def __init__(self, proj_dim, hidden_dim, epsilon=1e-8):
+        super().__init__()
+
+        self.attention_weights = nn.Linear(proj_dim, hidden_dim)
+        self.projection_weights = nn.Linear(proj_dim, hidden_dim)
+        self.epsilon = epsilon
+
+    def forward(self, img, txt):
+        e_i = torch.exp(self.attention_weights(img))
+        e_t = torch.exp(self.attention_weights(txt))
+        img_prj = torch.relu(self.projection_weights(img)) 
+        txt_prj = torch.relu(self.projection_weights(txt))
+        lmd = e_i / (e_i + e_t)
+        return img_prj.pow(lmd) * txt_prj.pow(1-lmd)
+
+
+class TransformerFuser(L.LightningModule):
+    def __init__(self, hidden_dim, layers=1, dropout=.1):
+        super().__init__()
+
+        module = nn.TransformerEncoderLayer(hidden_dim, 12, hidden_dim*4, 
+                                            dropout=dropout, 
+                                            activation=F.gelu, 
+                                            batch_first=True, 
+                                            norm_first=True,)
+        self.transformer = nn.TransformerEncoder(module, layers)
+
+    def forward(self, img, txt, mask=None):
+        if mask is not None:
+            img_msk = torch.zeros_like(img[:, :, 0], device=self.device)
+            txt_msk = (1-mask)
+            mask = torch.cat([img_msk, txt_msk], -1).bool()
+
+        x = torch.cat([img, 
+                       txt], dim=1)
+        x = self.transformer(x, src_key_padding_mask=mask)
+        txt_token_idx = img.shape[0]
+        
+        return x[:, 0], x[:, txt_token_idx], #img, txt
+
+class TransformerExtraFuser(TransformerFuser):
+    def forward(self, img, txt, mask=None, output_all=False):
+        if mask is not None:
+            bs = img.shape[0]
+            img_msk = torch.zeros_like(img[:, :, 0])
+            txt_msk = (1-mask)
+            multi_msk = torch.zeros((bs, 2), device=self.device)
+            mask = torch.cat([multi_msk, img_msk, txt_msk], -1).bool()
+
+        img_tok, txt_tok = img[:, 0], txt[:, 0]
+        diff = torch.abs(img_tok-txt_tok).unsqueeze(1)
+        mult = (img_tok*txt_tok).unsqueeze(1)
+        
+        x = torch.cat([diff, mult, img, txt], dim=1)
+        x = self.transformer(x, src_key_padding_mask=mask)
+        txt_token_idx = img.shape[0]+2
+
+        if output_all:
+            return x[:, 2:txt_token_idx], x[:, txt_token_idx:], x[:, 0], x[:, 1]
+        else:
+            return x[:, 2], x[:, txt_token_idx], x[:, 0], x[:, 1] #img, txt, diff, mult
+
+
 
 class SimilarityFuser(nn.Module):
     def __init__(self, input_dim):

@@ -2,7 +2,6 @@ from transformers import AutoModel, Adafactor
 from transformers import CLIPTextConfig, CLIPVisionConfig
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup, get_constant_schedule_with_warmup
 from torch import nn
-from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 
 import torch.nn.functional as F
 import pytorch_lightning as L
@@ -11,14 +10,10 @@ import numpy as np
 import torch
 import einops
 
-from modules import ForwardModuleList, LossBalancer, EMABalancer, AlignedFuser
-from torch.optim import AdamW
-from tqdm.auto import tqdm
-from torch.utils.data import DataLoader
-from dataset import AugmentedWrapperDataset
+from modules import FuseExtraHead, TransformerExtraFuser
 
 from torchmetrics import Accuracy, F1Score, AUROC
-
+from losses import NCEandRCE as LOSS
 
 def set_dropout(model, drop_rate=0.1):
     for name, child in model.named_children():
@@ -53,7 +48,20 @@ class PretrainModel(L.LightningModule):
         self.encoder = encoder
         self.n_outputs = n_outputs
         self.eps = 1e-8
-
+        
+        self.loss = LOSS(num_classes=self.n_outputs, alpha=5., beta=.1, class_weights=torch.tensor([0.23458736,  
+                                                                                                     1.22896955,  
+                                                                                                     3.48044125,  
+                                                                                                     4.78477299, 
+                                                                                                     30.48967285,
+                                                                                                     2.53554996]))
+        '''self.loss = nn.CrossEntropyLoss(weight=torch.tensor([0.23458736,  
+                                                             1.22896955,  
+                                                             3.48044125,  
+                                                             4.78477299, 
+                                                             30.48967285,
+                                                             2.53554996]))'''
+        
         self.configure_transformer()
         self.configure_metrics()
 
@@ -71,58 +79,39 @@ class PretrainModel(L.LightningModule):
         key = '_' + split
 
         validating = split in {'valid', 'test'}
-        binary_labels = (torch.max(labels, dim=-1)[1] != 0).float()
-        binary_preds = preds[:, 1:].sum(-1) - preds[:, 0]
+        binary_labels = (torch.max(labels, dim=-1)[1] != 0).long()
+        hate_ = torch.max(preds[:,1:], dim=-1)[0]
+        binary_preds = torch.softmax(torch.stack([preds[:, 0], hate_], dim=-1), -1)[:, 0]
 
         for metric, function in self.metrics[key].items():
-            function(binary_preds, binary_labels.squeeze())
-            self.log(f'{split}_{metric}', function, on_epoch=validating)
+            function.update(binary_preds, binary_labels.squeeze())
+            self.log(f'{split}/{metric}', function, on_epoch=validating)
 
     def training_step(self, batch, batch_idx):
         encoded_batch, labels = batch
-        preds = self(**encoded_batch).squeeze()
-        binary_preds = preds[:, 1:].sum(-1) - preds[:, 0]
-        binary_labels = (torch.max(labels, dim=-1)[1] != 0).float()
-        bin_loss = F.binary_cross_entropy_with_logits(binary_preds,
-                                                      binary_labels.squeeze(),
-                                                      reduction='none',
-                                                      )
-        #bcw = torch.tensor([1., .1], device=self.device)
-        bcw = torch.tensor([1., .2], device=self.device)
-        bin_loss = torch.where(binary_labels==1, bcw[0] * bin_loss, bcw[1] * bin_loss).mean()       
-        mul_loss = F.cross_entropy(preds,
-                                   torch.softmax(labels, -1),
-                                   reduction='mean',
-                                   weight=torch.tensor([.2, 1., 1., 1., 1., 1.], device=self.device),
-                                   )
-        beta = .2
-        loss = beta * mul_loss + (1-beta) * bin_loss 
-
-        self.log("train_loss", loss)
-        self.log("train_mloss", mul_loss)
-        self.log("train_bloss", bin_loss)
-        self.log_eval(preds.detach(), labels.detach(), 'train')
+        preds = self(**encoded_batch)
+        _labels = torch.softmax(labels, -1)
+        loss = self.loss.to(self.device)(preds, _labels)
+        self.log('train/loss', loss)
+        self.log_eval(preds, labels, 'train')
         return loss
 
     def validation_step(self,  batch, batch_idx):
         encoded_batch, labels = batch
-        preds = self(**encoded_batch).squeeze()
+        preds = self(**encoded_batch)
         self.log_eval(preds, labels, 'valid')
 
     def test_step(self,  batch, batch_idx):
         encoded_batch, labels = batch
-        preds = self(**encoded_batch).squeeze()
-
+        preds = self(**encoded_batch)
         self.log_eval(preds, labels, 'test')
-
-        return None
 
     def configure_optimizers(self):
         optimizer = Adafactor([
             {"params": self.parameters(), "lr": self.learning_rate},
             ],
             lr=self.learning_rate,
-            weight_decay=1e-2,
+            weight_decay=1e-4,
             relative_step=False,
             scale_parameter=False,
             warmup_init=False,
@@ -146,7 +135,126 @@ class PretrainModel(L.LightningModule):
                 'lr_scheduler': lr_scheduler_config,
                 }
 
+class CLIPBaseModel(PretrainModel):
+    def freeze(self):
+        if self.frozen == 'all':
+            freeze_module(self.transformer)
+        
+        elif self.frozen == 'body':
+            freeze_module(self.transformer.text_model)
+            freeze_module(self.transformer.vision_model)
 
+        else:
+            f = float(self.frozen)
+            n_text = int(len(self.transformer.text_model.encoder.layers) * f)
+            n_vision = int(len(self.transformer.vision_model.encoder.layers) * f)
+
+            freeze_module(self.transformer.text_model.embeddings)
+            freeze_module(self.transformer.vision_model.embeddings)
+
+            for layer in self.transformer.text_model.encoder.layers[:n_text]:
+                freeze_module(layer)
+
+            for layer in self.transformer.vision_model.encoder.layers[:n_vision]:
+                freeze_module(layer)
+
+class DualEncoderBaseModel(PretrainModel):
+    def freeze(self):
+        if self.frozen == 'all':
+            freeze_module(self.text_model)
+            freeze_module(self.vision_model)
+        
+        elif self.frozen == 'body':
+            freeze_module(self.text_model)
+            freeze_module(self.vision_model)
+
+        else:
+            f = float(self.frozen)
+            n_text = int(len(self.text_model.encoder.layers) * f)
+            n_vision = int(len(self.vision_model.encoder.layers) * f)
+
+            freeze_module(self.text_model.embeddings)
+            freeze_module(self.vision_model.embeddings)
+
+            for layer in self.text_model.encoder.layers[:n_text]:
+                freeze_module(layer)
+
+            for layer in self.vision_model.encoder.layers[:n_vision]:
+                freeze_module(layer)
+
+class DualEncoderRobustModel(DualEncoderBaseModel):
+    def configure_transformer(self):
+        #jayanta/vit-base-patch16-224-FV2-finetuned-memes /// 768
+        self.vision_model = AutoModel.from_pretrained(self.encoder['vision'],)
+        #cardiffnlp/twitter-xlm-roberta-base /// 768
+        self.text_model = AutoModel.from_pretrained(self.encoder['text'],)
+                 
+        set_dropout(self.transformer, self.dropout)
+
+        self.freeze()
+
+        input_dim = 768
+        self.text_projection = nn.Linear(input_dim, input_dim)
+        self.visual_projection = nn.Linear(input_dim, input_dim)
+
+        self.projector = TransformerExtraFuser(input_dim, layers=6, dropout=self.dropout)
+        self.classifier = FuseExtraHead(hidden_dim=input_dim, 
+                                        n_outputs=self.n_outputs, 
+                                        n_layers=3, 
+                                        dropout=self.dropout)
+    
+    def forward(self, *args, **kwargs):
+        output = self.transformer(*args, **kwargs)
+        img, txt = self.transformer.visual_projection(output.vision_model_output.last_hidden_state), \
+                   self.transformer.text_projection(output.text_model_output.last_hidden_state)
+        
+        projected_img, projected_txt, projected_diff, projected_mult = self.projector(img, 
+                                                                                      txt, 
+                                                                                      mask=kwargs['attention_mask'])
+        
+        token_img, token_txt = img[:, 0], txt[:, 0]
+
+        r_img = token_img+projected_img
+        r_txt = token_txt+projected_txt
+        r_diff = torch.abs(token_img-token_txt) + projected_diff
+        r_mult = token_img*token_txt + projected_mult
+
+        return self.classifier(r_img, r_txt, r_diff, r_mult)
+
+class CLIPRobustModel(CLIPBaseModel):
+    def configure_transformer(self):
+        self.transformer = AutoModel.from_pretrained(self.encoder,)
+                                  
+        set_dropout(self.transformer, self.dropout)
+
+        self.freeze()
+
+        input_dim = 768
+        self.projector = TransformerExtraFuser(input_dim, layers=6, dropout=self.dropout)
+        self.classifier = FuseExtraHead(hidden_dim=input_dim, 
+                                        n_outputs=self.n_outputs, 
+                                        n_layers=3, 
+                                        dropout=self.dropout)
+    
+    def forward(self, *args, **kwargs):
+        output = self.transformer(*args, **kwargs)
+        img, txt = self.transformer.visual_projection(output.vision_model_output.last_hidden_state), \
+                   self.transformer.text_projection(output.text_model_output.last_hidden_state)
+        
+        projected_img, projected_txt, projected_diff, projected_mult = self.projector(img, 
+                                                                                      txt, 
+                                                                                      mask=kwargs['attention_mask'])
+        
+        token_img, token_txt = img[:, 0], txt[:, 0]
+
+        r_img = token_img+projected_img
+        r_txt = token_txt+projected_txt
+        r_diff = torch.abs(token_img-token_txt) + projected_diff
+        r_mult = token_img*token_txt + projected_mult
+
+        return self.classifier(r_img, r_txt, r_diff, r_mult)
+    
+'''
 class CLIPPretrainModel(PretrainModel):
     def configure_transformer(self):
         self.transformer = AutoModel.from_pretrained(self.encoder)
@@ -175,7 +283,7 @@ class CLIPPretrainModel(PretrainModel):
 
         for layer in self.transformer.vision_model.encoder.layers[:self.frozen*2]:
             freeze_module(layer)
-'''
+
 class ALIGNPretrainModel(PretrainModel):
     def configure_transformer(self):
         self.transformer = AutoModel.from_pretrained(self.encoder,)
