@@ -4,13 +4,14 @@ import torch
 from torchmetrics import MetricCollection
 from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
 from torchmetrics.classification import MulticlassAUROC, MulticlassAccuracy, MulticlassF1Score
+from torchmetrics.classification import MultilabelAUROC, MultilabelAccuracy, MultilabelF1Score
 
 from torch.optim import AdamW
 from transformers import AutoModel
 
 from torch import nn
 
-from modules import BatchnNormProject, FFHead, FFLayer, FFResLayer, ForwardModuleList, NormalizeProject
+from modules import BatchnNormProject, FFHead, FFLayer, FFResLayer, ForwardModuleList, NormalizeProject, ProjectionLayer
 
 def freeze_module(m):
     for param in m.parameters():
@@ -24,6 +25,7 @@ class DefaultModel(L.LightningModule):
                  lr=1e-4,
                  warmup_p=.1,
                  frozen='base',
+                 loss='cce',
                  *args, **kwargs):
         
         super().__init__(*args, **kwargs)
@@ -36,10 +38,20 @@ class DefaultModel(L.LightningModule):
         self.num_training_steps = training_steps
         self.num_warmup_steps = int(warmup_p*training_steps)
         self.eps = 1e-8
-        self.loss_functions = [nn.CrossEntropyLoss(weight=torch.tensor(cw).float()) for cw in class_weights]
-        self.output_list = [len(cw) for cw in class_weights]
+        self.loss = loss
+        if loss == 'cce':
+            self.loss_functions = [nn.CrossEntropyLoss(weight=torch.tensor(cw).float()) for cw in class_weights]
+            self.output_list = [len(cw) for cw in class_weights]
+
+        if loss == 'bce':
+            self.loss_functions = nn.BCEWithLogitsLoss(weight=torch.tensor(class_weights).float())
+            self.output_list = [len(class_weights)]
         #self.name
         self.define_metrics()
+
+    def mean_pooling(self, token_embeddings, attention_mask):
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def define_metrics(self):
         self.metrics = {'train':[], 
@@ -47,19 +59,27 @@ class DefaultModel(L.LightningModule):
                         'test':[]}
 
         for i, n in enumerate(self.output_list):
-            metrics = MetricCollection([MulticlassAccuracy(n), 
-                                         MulticlassAUROC(n), 
-                                         MulticlassF1Score(n)])
+            if self.loss == 'cce':
+                metrics = MetricCollection([MulticlassAccuracy(n), 
+                                            MulticlassAUROC(n), 
+                                            MulticlassF1Score(n)])
+            elif self.loss == 'bce':
+                metrics = MetricCollection([MultilabelAccuracy(n), 
+                                            MultilabelAUROC(n), 
+                                            MultilabelF1Score(n)])
+
             for k in self.metrics.keys():
                 self.metrics[k].append(metrics.clone(prefix=f'{k}/target_{i}_'))
 
     def update_metrics(self, preds, labels, split='valid'):
         if len(labels.shape) <= 1:
             labels=labels.unsqueeze(-1)
-        
-        for m, l, p in zip(self.metrics[split], labels.unbind(-1), preds):
-            m.update(p.cpu(), l.cpu())
-            
+        if self.loss == 'cce':
+            for m, l, p in zip(self.metrics[split], labels.unbind(-1), preds):
+                m.update(p.cpu(), l.cpu())
+        elif self.loss == 'bce':
+            self.metrics[split][0].update(preds[0].cpu(), labels.int().cpu())                
+
     def compute_metrics(self, split='valid'):
         for m in self.metrics[split]:
             output = m.compute()
@@ -139,15 +159,21 @@ class BaseClipModel(DefaultModel):
             labels=labels.unsqueeze(-1)
 
         losses = []
-        for m_p, y, l in zip(preds,
-                             labels.unbind(axis=-1),
-                             self.loss_functions):
-            fnc = l.to(self.device)
+        if self.loss == 'cce':
+            for m_p, y, l in zip(preds,
+                                labels.unbind(axis=-1),
+                                self.loss_functions):
+                fnc = l.to(self.device)
 
-            m_loss = fnc(m_p, y)
-            losses.append(m_loss)
+                m_loss = fnc(m_p, y)
+                losses.append(m_loss)
 
-        loss=torch.nanmean(torch.stack(losses))
+            loss=torch.nanmean(torch.stack(losses))
+        
+        elif self.loss == 'bce':
+            fnc = self.loss_functions.to(self.device)
+            loss = fnc(preds[0], labels)
+
         with torch.no_grad():
             self.log('train/loss', loss)
             self.update_metrics(preds, labels, 'train')
@@ -182,21 +208,75 @@ class ClipNormModel(BaseClipModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         input_dim = self.multimodal.config.projection_dim
-        output_dim = 1024
-        self.projector_img = nn.Linear(input_dim, output_dim)
-        self.projector_text = nn.Linear(input_dim, output_dim)
+        output_dim = 128
+        self.projector = nn.Linear(input_dim, output_dim)
 
         self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=output_dim*4, 
                                                           n_outputs=i, 
-                                                          n_layers=3, 
+                                                          n_layers=2,
+                                                          norm=True,
+                                                          residual=False,
                                                           dropout=self.dropout) for i in self.output_list])
 
     def forward(self, x):
         output = self.multimodal(**x)
-        img, txt = self.projector_img(F.normalize(output.image_embeds,-1)), self.projector_text(F.normalize(output.text_embeds,-1))
+        img, txt = F.normalize(self.projector(F.gelu(output.image_embeds)), -1), \
+                   F.normalize(self.projector(F.gelu(output.text_embeds)), -1)
         combined = torch.cat([img, txt, torch.abs(img-txt), img*txt], dim=-1)
         return self.multi_classifier(combined), None
-  
+
+class ClipSimModel(BaseClipModel):
+    NAME = 'ClipSimModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        input_dim = self.multimodal.config.projection_dim
+        output_dim = 256
+        self.projector = nn.Linear(input_dim, output_dim, bias=False)
+        self.visual_projector = nn.Linear(input_dim, output_dim, bias=False)
+        self.text_projector = nn.Linear(input_dim, output_dim, bias=False)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=output_dim*4, 
+                                                          n_outputs=i, 
+                                                          n_layers=2,
+                                                          norm=True,
+                                                          residual=False,
+                                                          dropout=self.dropout) for i in self.output_list])
+
+    def forward(self, x):
+        output = self.multimodal(**x)
+        token_img = F.gelu(output.image_embeds)
+        token_txt = F.gelu(output.text_embeds)
+        img_multi, txt_multi = F.normalize(self.projector(token_img)), \
+                               F.normalize(self.projector(token_txt))
+        img, txt = F.normalize(self.visual_projector(token_img)), F.normalize(self.text_projector(token_img))
+        combined = torch.cat([torch.abs(txt_multi-img_multi), img_multi*txt_multi, img, txt], dim=-1)
+        return self.multi_classifier(combined), None
+
+class ClipNormWOSiameseModel(BaseClipModel):
+    NAME = 'ClipNormWOSiameseModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        input_dim = self.multimodal.config.projection_dim
+        output_dim = 128
+        self.projector_1 = nn.Linear(input_dim, output_dim)
+        self.projector_2 = nn.Linear(input_dim, output_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=output_dim*4, 
+                                                          n_outputs=i, 
+                                                          n_layers=2,
+                                                          norm=True,
+                                                          residual=False,
+                                                          dropout=self.dropout) for i in self.output_list])
+
+    def forward(self, x):
+        output = self.multimodal(**x)
+        img, txt = F.normalize(self.projector_1(F.gelu(output.image_embeds)), -1), \
+                   F.normalize(self.projector_2(F.gelu(output.text_embeds)), -1)
+        combined = torch.cat([img, txt, torch.abs(img-txt), img*txt], dim=-1)
+        return self.multi_classifier(combined), None
+
 class HatecliperModel(BaseClipModel):
     NAME = 'HatecliperModel'
     
@@ -204,8 +284,8 @@ class HatecliperModel(BaseClipModel):
         super().__init__(*args, **kwargs)
         input_dim = self.multimodal.config.projection_dim
         output_dim = 1024
-        self.projector_img = nn.Linear(input_dim, output_dim)
-        self.projector_text = nn.Linear(input_dim, output_dim)
+        self.projector_img = ProjectionLayer(1024, output_dim, dropout=self.dropout, norm=False)
+        self.projector_text = ProjectionLayer(input_dim, output_dim, dropout=self.dropout, norm=False)
 
         self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=output_dim, 
                                                           n_outputs=i, 
@@ -216,7 +296,10 @@ class HatecliperModel(BaseClipModel):
 
     def forward(self, x):
         output = self.multimodal(**x)
-        img, txt = self.projector_img(F.gelu(output.image_embeds)), self.projector_text(F.gelu(output.text_embeds))
+        text_output = output.text_model_output.pooler_output
+        vision_output = output.vision_model_output.pooler_output
+
+        img, txt = self.projector_img(vision_output), self.projector_text(text_output)
         img, txt = F.normalize(img,-1), F.normalize(txt,-1)
 
         return self.multi_classifier(img*txt), None
@@ -462,7 +545,7 @@ class NormClipXlmtVitModel(BaseClipXlmtVitModel):
         m_dim = self.multimodal.config.projection_dim
         i_dim = self.vision.config.hidden_size
         t_dim = self.text.config.hidden_size
-        common_dim = 1024
+        common_dim = 128
         f_dim = common_dim*4
 
         self.projection_multi_vision = nn.Linear(m_dim, common_dim)
@@ -473,29 +556,352 @@ class NormClipXlmtVitModel(BaseClipXlmtVitModel):
         self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
                                                    n_outputs=i, 
                                                    n_layers=1, 
-                                                   dropout=self.dropout) for i in self.output_list])
+                                                   dropout=self.dropout, 
+                                                   norm=True) for i in self.output_list])
         self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
                                                          n_outputs=i, 
                                                          n_layers=1, 
-                                                         dropout=self.dropout) for i in self.output_list])
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
         self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
                                                            n_outputs=i, 
                                                            n_layers=1, 
-                                                           dropout=self.dropout) for i in self.output_list])
+                                                           dropout=self.dropout, norm=True) for i in self.output_list])
         self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
                                                          n_outputs=i, 
-                                                         n_layers=3, 
-                                                         dropout=self.dropout) for i in self.output_list])
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
 
     def forward(self, m, i, t):
-        multi_output = self.multimodal(output_hidden_states=True, **m)
-        vision_output = self.vision(output_hidden_states=True, **i)
-        text_output = self.text(output_hidden_states=True, **t)
+        multi_output = self.multimodal(**m)
+        vision_output = self.vision(**i)
+        text_output = self.text(**t)
 
-        multi_v_cls = F.normalize(self.projection_multi_vision(F.gelu(multi_output.image_embeds),), dim=-1)
-        multi_t_cls = F.normalize(self.projection_multi_text(F.gelu(multi_output.text_embeds)), dim=-1)
-        vision_cls = F.normalize(self.projection_vision(F.gelu(vision_output.last_hidden_state[:, 0])), dim=-1)
-        text_cls = F.normalize(self.projection_text(F.gelu(text_output.last_hidden_state[:, 0])), dim=-1)
+        multi_v_cls = F.normalize(self.projection_multi_vision(F.gelu(multi_output.image_embeds)), -1)
+        multi_t_cls = F.normalize(self.projection_multi_text(F.gelu(multi_output.text_embeds),), -1)
+        vision_cls = F.normalize(self.projection_vision(F.gelu(vision_output.last_hidden_state[:, 0])), -1)
+        text_cls = F.normalize(self.projection_text(F.gelu(text_output.last_hidden_state[:, 0])), -1)
+
+        multi = torch.cat([multi_v_cls * multi_t_cls, torch.abs(multi_t_cls - multi_v_cls)], -1)
+
+        multi_pred = self.multi_classifier(multi)
+        vision_pred = self.vision_classifier(vision_cls)
+        text_pred = self.text_classifier(text_cls)
+
+        all_cls = torch.cat([vision_cls, text_cls, multi], axis=-1)
+        all_pred = self.full_classifier(all_cls)
+
+        return all_pred, multi_pred, vision_pred, text_pred
+
+class NormPlusClipXlmtVitModel(BaseClipXlmtVitModel):
+    NAME = 'NormPlusClipXlmtVitModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        m_dim = self.multimodal.config.projection_dim
+        i_dim = self.vision.config.hidden_size
+        t_dim = self.text.config.hidden_size
+        common_dim = 128
+        f_dim = common_dim*4
+
+        self.projection_multi_vision = nn.Linear(m_dim, common_dim)
+        self.projection_multi_text = nn.Linear(m_dim, common_dim)
+        self.projection_vision = nn.Linear(i_dim+m_dim, common_dim)
+        self.projection_text = nn.Linear(t_dim+m_dim, common_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
+                                                   n_outputs=i, 
+                                                   n_layers=1, 
+                                                   dropout=self.dropout, 
+                                                   norm=True) for i in self.output_list])
+        self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=1, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+        self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                           n_outputs=i, 
+                                                           n_layers=1, 
+                                                           dropout=self.dropout, norm=True) for i in self.output_list])
+        self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+
+    def forward(self, m, i, t):
+        multi_output = self.multimodal(**m)
+        vision_output = self.vision(**i)
+        text_output = self.text(**t)
+
+        multi_v_tok = F.gelu(multi_output.image_embeds)
+        multi_t_tok = F.gelu(multi_output.text_embeds)
+        vision_tok = F.gelu(vision_output.last_hidden_state.mean(1))
+        vision_tok = torch.cat([vision_tok, multi_v_tok], dim=-1)
+        text_tok = F.gelu(self.mean_pooling(text_output.last_hidden_state, t.attention_mask))
+        text_tok =  torch.cat([text_tok, multi_t_tok], dim=-1)
+
+        multi_v_cls = F.normalize(self.projection_multi_vision(multi_v_tok), -1)
+        multi_t_cls = F.normalize(self.projection_multi_text(multi_t_tok), -1)
+        vision_cls = F.normalize(self.projection_vision(vision_tok), -1)
+        text_cls = F.normalize(self.projection_text(text_tok), -1)
+
+        multi = torch.cat([multi_v_cls * multi_t_cls, torch.abs(multi_t_cls - multi_v_cls)], -1)
+
+        multi_pred = self.multi_classifier(multi)
+        vision_pred = self.vision_classifier(vision_cls)
+        text_pred = self.text_classifier(text_cls)
+
+        all_cls = torch.cat([vision_cls, text_cls, multi], axis=-1)
+        all_pred = self.full_classifier(all_cls)
+
+        return all_pred, multi_pred, vision_pred, text_pred
+
+class NormPlusV2ClipXlmtVitModel(BaseClipXlmtVitModel):
+    NAME = 'NormPlusV2ClipXlmtVitModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        m_dim = self.multimodal.config.projection_dim
+        i_dim = self.vision.config.hidden_size
+        t_dim = self.text.config.hidden_size
+        common_dim = 16#128
+        f_dim = common_dim*4
+
+        self.projection_multi = nn.Linear(m_dim, common_dim)
+        self.projection_vision = nn.Linear(i_dim+m_dim, common_dim)
+        self.projection_text = nn.Linear(t_dim+m_dim, common_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
+                                                   n_outputs=i, 
+                                                   n_layers=1, 
+                                                   dropout=self.dropout, 
+                                                   norm=True) for i in self.output_list])
+        self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=1, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+        self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                           n_outputs=i, 
+                                                           n_layers=1, 
+                                                           dropout=self.dropout, 
+                                                           norm=True) for i in self.output_list])
+        self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+
+    def forward(self, m, i, t):
+        multi_output = self.multimodal(**m)
+        vision_output = self.vision(**i)
+        text_output = self.text(**t)
+
+        multi_v_tok = F.gelu(multi_output.image_embeds)
+        multi_t_tok = F.gelu(multi_output.text_embeds)
+        vision_tok = F.gelu(vision_output.last_hidden_state.mean(1))
+        vision_tok = torch.cat([vision_tok, multi_v_tok], dim=-1)
+        text_tok = F.gelu(self.mean_pooling(text_output.last_hidden_state, t.attention_mask))
+        text_tok =  torch.cat([text_tok, multi_t_tok], dim=-1)
+
+        multi_v_cls = F.normalize(self.projection_multi(multi_v_tok), -1)
+        multi_t_cls = F.normalize(self.projection_multi(multi_t_tok), -1)
+        vision_cls = F.normalize(self.projection_vision(vision_tok), -1)
+        text_cls = F.normalize(self.projection_text(text_tok), -1)
+
+        multi = torch.cat([multi_v_cls * multi_t_cls, torch.abs(multi_t_cls - multi_v_cls)], -1)
+
+        multi_pred = self.multi_classifier(multi)
+        vision_pred = self.vision_classifier(vision_cls)
+        text_pred = self.text_classifier(text_cls)
+
+        all_cls = torch.cat([vision_cls, text_cls, multi], axis=-1)
+        all_pred = self.full_classifier(all_cls)
+
+        return all_pred, multi_pred, vision_pred, text_pred
+
+class NPV3ClipXlmtVitModel(BaseClipXlmtVitModel):
+    NAME = 'NPV3ClipXlmtVitModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        m_dim = self.multimodal.config.projection_dim
+        i_dim = self.vision.config.hidden_size
+        t_dim = self.text.config.hidden_size
+        common_dim = 256
+        f_dim = common_dim*4
+
+        self.projection_vision = nn.Linear(i_dim, common_dim)
+        self.projection_text = nn.Linear(t_dim, common_dim)
+        self.projection_mvision = nn.Linear(1024, common_dim)
+        self.projection_mtext = nn.Linear(m_dim, common_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
+                                                   n_outputs=i, 
+                                                   n_layers=1, 
+                                                   dropout=self.dropout, 
+                                                   norm=True) for i in self.output_list])
+        self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=1, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+        self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                           n_outputs=i, 
+                                                           n_layers=1, 
+                                                           dropout=self.dropout, 
+                                                           norm=True) for i in self.output_list])
+        self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+
+    def forward(self, m, i, t):
+        multi_output = self.multimodal(**m, output_hidden_states=True)
+        vision_output = self.vision(**i, output_hidden_states=True)
+        text_output = self.text(**t, output_hidden_states=True)
+
+        multi_v_tok = F.gelu(multi_output.vision_model_output.hidden_states[-2].mean(1))
+        multi_t_tok = F.gelu(self.mean_pooling(multi_output.text_model_output.hidden_states[-2], m.attention_mask))
+        vision_tok = F.gelu(vision_output.hidden_states[-2].mean(1))
+        text_tok = F.gelu(self.mean_pooling(text_output.hidden_states[-2], t.attention_mask))
+
+        multi_v_cls = F.normalize(self.projection_mvision(multi_v_tok), -1)
+        multi_t_cls = F.normalize(self.projection_mtext(multi_t_tok), -1)
+        vision_cls = F.normalize(self.projection_vision(vision_tok), -1)
+        text_cls = F.normalize(self.projection_text(text_tok), -1)
+
+        multi = torch.cat([multi_v_cls,  multi_t_cls], -1)
+
+        multi_pred = self.multi_classifier(multi)
+        vision_pred = self.vision_classifier(vision_cls)
+        text_pred = self.text_classifier(text_cls)
+
+        all_cls = torch.cat([vision_cls, text_cls, multi], axis=-1)
+        all_pred = self.full_classifier(all_cls)
+
+        return all_pred, multi_pred, vision_pred, text_pred
+
+class AltPlusClipXlmtVitModel(BaseClipXlmtVitModel):
+    NAME = 'AltPlusClipXlmtVitModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        m_dim = self.multimodal.config.projection_dim
+        i_dim = self.vision.config.hidden_size
+        t_dim = self.text.config.hidden_size
+        common_dim = 128
+        f_dim = common_dim*6
+
+        self.projection_multi_vision = nn.Linear(m_dim, common_dim)
+        self.projection_multi_text = nn.Linear(m_dim, common_dim)
+        self.projection_vision = nn.Linear(i_dim, common_dim)
+        self.projection_text = nn.Linear(t_dim, common_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
+                                                   n_outputs=i, 
+                                                   n_layers=1, 
+                                                   dropout=self.dropout, 
+                                                   norm=True) for i in self.output_list])
+        self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=1, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+        self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                           n_outputs=i, 
+                                                           n_layers=1, 
+                                                           dropout=self.dropout, norm=True) for i in self.output_list])
+        self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+
+    def forward(self, m, i, t):
+        multi_output = self.multimodal(**m)
+        vision_output = self.vision(**i)
+        text_output = self.text(**t)
+
+        multi_v_tok = F.gelu(multi_output.image_embeds)
+        multi_t_tok = F.gelu(multi_output.text_embeds)
+        vision_tok = F.gelu(vision_output.last_hidden_state.mean(1))
+        text_tok = F.gelu(self.mean_pooling(text_output.last_hidden_state, t.attention_mask))
+
+        multi_v_cls = F.normalize(self.projection_multi_vision(multi_v_tok), -1)
+        multi_t_cls = F.normalize(self.projection_multi_text(multi_t_tok), -1)
+        vision_cls = F.normalize(self.projection_vision(vision_tok), -1)
+        text_cls = F.normalize(self.projection_text(text_tok), -1)
+
+        multi = torch.cat([multi_v_cls * multi_t_cls, torch.abs(multi_t_cls - multi_v_cls)], -1)
+
+        multi_pred = self.multi_classifier(multi)
+        vision_pred = self.vision_classifier(vision_cls)
+        text_pred = self.text_classifier(text_cls)
+
+        all_cls = torch.cat([multi_v_cls, multi_t_cls, vision_cls, text_cls, multi], axis=-1)
+        all_pred = self.full_classifier(all_cls)
+
+        return all_pred, multi_pred, vision_pred, text_pred
+
+class PlusClipXlmtVitModel(BaseClipXlmtVitModel):
+    NAME = 'PlusClipXlmtVitModel'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        m_dim = self.multimodal.config.projection_dim
+        i_dim = self.vision.config.hidden_size
+        t_dim = self.text.config.hidden_size
+        common_dim = 128
+        f_dim = common_dim*4
+
+        self.projection_multi_vision = nn.Linear(m_dim, common_dim)
+        self.projection_multi_text = nn.Linear(m_dim, common_dim)
+        self.projection_vision = nn.Linear(i_dim, common_dim)
+        self.projection_text = nn.Linear(t_dim, common_dim)
+
+        self.multi_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim*2, 
+                                                   n_outputs=i, 
+                                                   n_layers=1, 
+                                                   dropout=self.dropout,
+                                                   norm=True) for i in self.output_list])
+        self.text_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=1, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+        self.vision_classifier = ForwardModuleList([FFHead(hidden_dim=common_dim, 
+                                                           n_outputs=i, 
+                                                           n_layers=1, 
+                                                           dropout=self.dropout, norm=True) for i in self.output_list])
+        self.full_classifier = ForwardModuleList([FFHead(hidden_dim=f_dim, 
+                                                         n_outputs=i, 
+                                                         n_layers=2, 
+                                                         dropout=self.dropout, 
+                                                         norm=True) for i in self.output_list])
+
+    def forward(self, m, i, t):
+        multi_output = self.multimodal(**m)
+        vision_output = self.vision(**i)
+        text_output = self.text(**t)
+
+        multi_v_tok = F.gelu(multi_output.image_embeds)
+        multi_t_tok = F.gelu(multi_output.text_embeds)
+        vision_tok = F.gelu(vision_output.last_hidden_state.mean(1))
+        text_tok = F.gelu(self.mean_pooling(text_output.last_hidden_state, t.attention_mask))
+
+        multi_v_cls = self.projection_multi_vision(multi_v_tok)
+        multi_t_cls = self.projection_multi_text(multi_t_tok)
+        vision_cls = self.projection_vision(vision_tok)
+        text_cls = self.projection_text(text_tok)
 
         multi = torch.cat([multi_v_cls * multi_t_cls, torch.abs(multi_t_cls - multi_v_cls)], -1)
 
@@ -562,8 +968,6 @@ class BatchNormClipXlmtVitModel(BaseClipXlmtVitModel):
         all_pred = self.full_classifier(all_cls)
 
         return all_pred, multi_pred, vision_pred, text_pred
-
-
 
 class PostNormClipXlmtVitModel(BaseClipXlmtVitModel):
     NAME = 'PostNormClipXlmtVitModel'

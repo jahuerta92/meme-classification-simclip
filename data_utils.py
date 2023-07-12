@@ -1,4 +1,4 @@
-from dataset import Memotion7k, MultiOFF, FBHM, MMHS150K, BalancedInterleavedDataset
+from dataset import Memotion7k, MultiOFF, FBHM, MMHS150K, HarmC, HarmP, Propaganda, BalancedInterleavedDataset
 
 from transformers import AutoProcessor
 
@@ -10,6 +10,7 @@ from torchvision.transforms import Compose
 
 import torchvision.transforms as T
 
+import numpy as np
 #from niacin.augment import RandAugment
 #from niacin.text import en
 
@@ -17,6 +18,9 @@ DATASET_ZOO = {'memotion7k': Memotion7k,
                'multioff':MultiOFF,
                'fbhm':FBHM,
                'mmhs150k':MMHS150K,
+               'harmp': HarmP,
+               'harmc': HarmC,
+               'propaganda': Propaganda
                }
 
 def text_augment(texts, augments):
@@ -111,7 +115,7 @@ class GeneralCollator:
                 p, l = args
                 encodings.append(self.process_multi(p, images, texts, l))
 
-        return encodings, torch.tensor(labels)
+        return encodings, torch.tensor(np.array(labels))
 
 
 def data_loader(data, split, processor, bs=32, max_length=40):

@@ -30,6 +30,132 @@ class DefaultDataset(Dataset):
     def to_dataframe(self):
         return self.dataframe
 
+class Propaganda(DefaultDataset):
+    FOLDER = join(ROOT_DATA, 'Propaganda')
+    DEV_METADATA = join(FOLDER, 'annotations/val.jsonl')
+    TEST_METADATA = join(FOLDER, 'annotations/test.jsonl')
+    TRAIN_METADATA = join(FOLDER, 'annotations/train.jsonl')
+    IMG_FOLDER = join(FOLDER, 'images')
+    LABEL_SHAPE = (22,)
+    TASK_TYPE = 'ml'
+
+    def __init__(self, split='train', text_option='text_corrected'):
+        self.split = split
+
+        if split == 'train':
+            self.dataframe = pd.read_json(self.TRAIN_METADATA, lines=True)
+        elif split == 'dev':
+            self.dataframe = pd.read_json(self.DEV_METADATA, lines=True).sample(frac=1., random_state=19)
+        elif split == 'test':
+            self.dataframe = pd.read_json(self.TEST_METADATA, lines=True)
+        else:
+            raise 'Only "train", "dev" or "test" allowed'
+        
+        all_labels = [i for v in self.dataframe.labels.values for i in v]
+        unique_labels = np.unique(all_labels)
+        self.label_2_id = {v: i for i, v in enumerate(unique_labels)}
+        self.class_weights = class_weight.compute_class_weight(class_weight = 'balanced',
+                                                               classes = np.unique(
+                                                                   all_labels),
+                                                               y = all_labels)
+
+    def __getitem__(self, index):
+        # RETURN FORMAT
+        # image, text, labels
+        row = self.dataframe.iloc[index]
+        img_file = row.image
+
+        image = Image.open(join(self.IMG_FOLDER, img_file)).convert('RGB')
+        text = str(row.text)
+        labels = np.zeros(shape=(self.LABEL_SHAPE[0]))
+        for v in row.labels:
+            labels[self.label_2_id[v]] = 1
+
+        return image, text, labels
+
+
+class HarmP(DefaultDataset):
+    FOLDER = join(ROOT_DATA, 'HarmP/data/datasets/memes/defaults')
+    DEV_METADATA = join(FOLDER, 'annotations/val.jsonl')
+    TEST_METADATA = join(FOLDER, 'annotations/test.jsonl')
+    TRAIN_METADATA = join(FOLDER, 'annotations/train.jsonl')
+    IMG_FOLDER = join(FOLDER, 'images')
+    LABEL_SHAPE = (3,)
+    TASK_TYPE = 'cls'
+
+    def __init__(self, split='train', text_option='text_corrected'):
+        self.split = split
+
+        if split == 'train':
+            self.dataframe = pd.read_json(self.TRAIN_METADATA, lines=True)
+        elif split == 'dev':
+            self.dataframe = pd.read_json(self.DEV_METADATA, lines=True).sample(frac=1., random_state=19)
+        elif split == 'test':
+            self.dataframe = pd.read_json(self.TEST_METADATA, lines=True)
+        else:
+            raise 'Only "train", "dev" or "test" allowed'
+        
+        all_labels = self.dataframe.labels.apply(lambda x: x[0]).values
+        unique_labels = np.unique(all_labels)
+        self.label_2_id = {v: i for i, v in enumerate(unique_labels)}
+        self.class_weights = [class_weight.compute_class_weight(class_weight = 'balanced',
+                                                               classes = np.unique(
+                                                                   all_labels),
+                                                               y = all_labels),]
+
+    def __getitem__(self, index):
+        # RETURN FORMAT
+        # image, text, labels
+        row = self.dataframe.iloc[index]
+        img_file = row.image
+
+        image = Image.open(join(self.IMG_FOLDER, img_file)).convert('RGB')
+        text = str(row.text)
+        label = int(self.label_2_id[row.labels[0]])
+
+        return image, text, label
+
+class HarmC(DefaultDataset):
+    FOLDER = join(ROOT_DATA, 'HarmC/defaults')
+    DEV_METADATA = join(FOLDER, 'annotations/val.jsonl')
+    TEST_METADATA = join(FOLDER, 'annotations/test.jsonl')
+    TRAIN_METADATA = join(FOLDER, 'annotations/train.jsonl')
+    IMG_FOLDER = join(FOLDER, 'images')
+    LABEL_SHAPE = (2,)
+    TASK_TYPE = 'cls'
+
+    def __init__(self, split='train', text_option='text_corrected'):
+        self.split = split
+
+        if split == 'train':
+            self.dataframe = pd.read_json(self.TRAIN_METADATA, lines=True)
+        elif split == 'dev':
+            self.dataframe = pd.read_json(self.DEV_METADATA, lines=True).sample(frac=1., random_state=19)
+        elif split == 'test':
+            self.dataframe = pd.read_json(self.TEST_METADATA, lines=True)
+        else:
+            raise 'Only "train", "dev" or "test" allowed'
+        
+        all_labels = self.dataframe.labels.apply(lambda x: x[0]).values
+        unique_labels = np.unique(all_labels)
+        self.label_2_id = {v: i for i, v in enumerate(unique_labels)}
+        self.class_weights = [class_weight.compute_class_weight(class_weight = 'balanced',
+                                                               classes = np.unique(
+                                                                   all_labels),
+                                                               y = all_labels),]
+
+    def __getitem__(self, index):
+        # RETURN FORMAT
+        # image, text, labels
+        row = self.dataframe.iloc[index]
+        img_file = row.image
+
+        image = Image.open(join(self.IMG_FOLDER, img_file)).convert('RGB')
+        text = str(row.text)
+        label = int(self.label_2_id[row.labels[0]])
+
+        return image, text, label
+
 class MMHS150K(DefaultDataset):
     FOLDER = join(ROOT_DATA, 'MMHS150K')
     DEV_METADATA = join(FOLDER, 'splits/val_ids.txt')
@@ -121,7 +247,6 @@ class FBHM(DefaultDataset):
 
         return image, text, label
 
-
 class MultiOFF(DefaultDataset):
     FOLDER = join(ROOT_DATA, 'MultiOFF')
     DEV_METADATA = join(FOLDER, 'Validation_meme_dataset.csv')
@@ -162,7 +287,6 @@ class MultiOFF(DefaultDataset):
         label = int(row.label)
 
         return image, text, label
-
 
 class Memotion7k(DefaultDataset):
     FOLDER = join(ROOT_DATA, 'Memotion7k')

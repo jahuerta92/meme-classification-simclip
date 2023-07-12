@@ -47,7 +47,28 @@ class OutLayer(nn.Module):
 
     def forward(self, x):
         return self.layer(x)
+    
+class ProjectionLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout=.1, layer_num=1, norm=True):
+        super().__init__()
+        layers = []
+        if norm:
+            layers.append(nn.LayerNorm(in_dim))
+        layers.append(nn.Linear(in_dim, out_dim)),
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        for _ in range(1, layer_num):
+            layers.append(nn.GELU())
+            if norm:
+                layers.append(nn.LayerNorm(out_dim))
+            layers.append(nn.Linear(out_dim, out_dim)),
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+        self.layer = nn.Sequential(*layers)
 
+    def forward(self, x):
+        return self.layer(x)
+       
 class FFHead(nn.Module):
     def __init__(self, hidden_dim, n_outputs, n_layers=1, dropout=.1, norm=True, residual=True):
         super().__init__()
